@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import base64
 import secrets
+import zipfile
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -84,3 +87,33 @@ def decode_base64_payload(data_b64: str) -> bytes:
 
 def encode_base64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
+
+
+_DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+
+def extract_docx_text(data: bytes) -> str | None:
+    """Extract plain text from a .docx file without external dependencies."""
+    try:
+        with zipfile.ZipFile(BytesIO(data)) as archive:
+            document_xml = archive.read("word/document.xml")
+    except (KeyError, zipfile.BadZipFile, OSError):
+        return None
+
+    try:
+        root = ET.fromstring(document_xml)
+    except ET.ParseError:
+        return None
+
+    paragraphs: list[str] = []
+    for paragraph in root.findall(".//w:p", _DOCX_NS):
+        parts = [
+            node.text
+            for node in paragraph.findall(".//w:t", _DOCX_NS)
+            if node.text
+        ]
+        if parts:
+            paragraphs.append("".join(parts))
+
+    text = "\n".join(paragraphs).strip()
+    return text or None

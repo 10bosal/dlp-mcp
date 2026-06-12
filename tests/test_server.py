@@ -1,12 +1,13 @@
 import asyncio
 import base64
 import os
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from dlp_mcp.decrypt import decode_base64_payload
+from dlp_mcp.decrypt import decode_base64_payload, extract_docx_text
 from dlp_mcp.server import EncryptedFileRef, decrypt_file
 
 
@@ -69,3 +70,15 @@ def test_decrypt_file_with_uploaded_file_ref(mock_client_cls, aes_key, tmp_path,
 
     assert result["success"] is True
     assert result["content_text"] == "hello via file ref"
+    assert result["download_url"].startswith("https://")
+    assert result["file_uri"]["file_name"] == "sample.txt"
+
+
+def test_extract_docx_text_from_decrypted_file():
+    docx_path = Path(__file__).resolve().parents[2] / "dlp-encrypt/tests/answers.docx"
+    if not docx_path.is_file():
+        pytest.skip("answers.docx not available")
+
+    text = extract_docx_text(docx_path.read_bytes())
+    assert text
+    assert "3.14" in text

@@ -15,7 +15,7 @@ from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from dlp_mcp.config import Settings
@@ -24,6 +24,7 @@ from dlp_mcp.decrypt import (
     decode_base64_payload,
     decrypt_aes_gcm,
     encode_base64,
+    extract_docx_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,8 +47,8 @@ mcp = FastMCP(
     instructions=(
         "Use decrypt_file when the user uploads an AES-GCM encrypted document. "
         "Always pass the uploaded file as encrypted_file. "
-        "Do not pass local file paths. "
-        "Use encrypted_data_b64 only when no uploaded file reference is available."
+        "Read the answer from content_text when present. "
+        "For binary documents, use file_uri.download_url instead of temp_path."
     ),
     stateless_http=True,
     json_response=True,
@@ -70,9 +71,33 @@ def _load_settings() -> Settings:
     return Settings.from_env()
 
 
+def _public_base_url() -> str:
+    return os.environ.get("PUBLIC_BASE_URL", "https://dlp-mcp.fly.dev").rstrip("/")
+
+
+def _guess_mime_type(filename: str, mime_type: str | None) -> str | None:
+    if mime_type:
+        return mime_type
+    ext = os.path.splitext(filename)[1].lower()
+    return {
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".pdf": "application/pdf",
+        ".txt": "text/plain",
+    }.get(ext)
+
+
+def _extract_readable_text(data: bytes, filename: str, mime_type: str | None) -> str | None:
+    text = _maybe_decode_text(data, mime_type)
+    if text is not None:
+        return text
+    if filename.lower().endswith(".docx") or (mime_type or "").endswith("wordprocessingml.document"):
+        return extract_docx_text(data)
+    return None
+
+
 async def _load_encrypted_bytes(
-  encrypted_file: EncryptedFileRef | None,
-  encrypted_data_b64: str | None,
+    encrypted_file: EncryptedFileRef | None,
+    encrypted_data_b64: str | None,
 ) -> bytes:
     if encrypted_file is not None:
         async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
@@ -146,15 +171,30 @@ async def decrypt_file(
 
     logger.info("Decrypted file saved to %s (%d bytes)", result.temp_path, len(result.plaintext))
 
+    resolved_mime = _guess_mime_type(result.filename, result.mime_type)
+    file_id = result.temp_path.name
+    download_url = f"{_public_base_url()}/files/{file_id}"
+    content_text = _extract_readable_text(result.plaintext, result.filename, resolved_mime)
+
     return {
         "success": True,
         "filename": result.filename,
-        "mime_type": result.mime_type,
+        "mime_type": resolved_mime,
         "size_bytes": len(result.plaintext),
-        "temp_path": str(result.temp_path),
         "expires_in_seconds": settings.temp_ttl_seconds,
         "content_b64": encode_base64(result.plaintext),
-        "content_text": _maybe_decode_text(result.plaintext, result.mime_type),
+        "content_text": content_text,
+        "download_url": download_url,
+        "file_uri": {
+            "download_url": download_url,
+            "file_id": file_id,
+            "mime_type": resolved_mime,
+            "file_name": result.filename,
+        },
+        "message": (
+            "Decryption succeeded. Use content_text for document body. "
+            "If content_text is empty, fetch file_uri.download_url for the decrypted file."
+        ),
     }
 
 
@@ -196,6 +236,25 @@ async def health(_: Request) -> JSONResponse:
     return JSONResponse({"status": "healthy", "service": "dlp-mcp"})
 
 
+async def download_decrypted_file(request: Request) -> Response:
+    settings = _load_settings()
+    file_id = request.path_params["file_id"]
+    if not file_id or "/" in file_id or ".." in file_id:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    path = settings.temp_dir / file_id
+    if not path.is_file():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+
+    age = time.time() - path.stat().st_mtime
+    if age > settings.temp_ttl_seconds:
+        return JSONResponse({"error": "Expired"}, status_code=410)
+
+    filename = path.name.split("_", 1)[-1] if "_" in path.name else path.name
+    media_type = _guess_mime_type(filename, None) or "application/octet-stream"
+    return FileResponse(path, filename=filename, media_type=media_type)
+
+
 def _verify_api_key(request: Request, settings: Settings) -> bool:
     if not settings.api_key:
         return True
@@ -224,7 +283,7 @@ def create_app() -> Starlette:
 
     class AuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
-            if request.url.path in ("/health",):
+            if request.url.path in ("/health",) or request.url.path.startswith("/files/"):
                 return await call_next(request)
             if not _verify_api_key(request, settings):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
@@ -233,6 +292,7 @@ def create_app() -> Starlette:
     app = Starlette(
         routes=[
             Route("/health", health),
+            Route("/files/{file_id}", download_decrypted_file, methods=["GET"]),
             Mount("/", app=mcp.streamable_http_app()),
         ],
         lifespan=lifespan,
