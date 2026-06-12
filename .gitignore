@@ -11,3 +11,6 @@ dist/
 build/
 .DS_Store
 *.log
+tests/.tmp/
+tests/answers.docx
+tests/answers_enc.docx
