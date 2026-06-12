@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+INPUT="${1:-$TESTS_DIR/answers_enc.docx}"
+
+if [[ "$INPUT" == *_enc.* ]]; then
+  OUTPUT="${INPUT/_enc./.}"
+else
+  OUTPUT="${INPUT%.*}_dec.${INPUT##*.}"
+fi
+
+ROOT="$(cd "$TESTS_DIR/.." && pwd)"
+
+KEY_FILE="$TESTS_DIR/KEY-HEX"
+if [[ ! -f "$KEY_FILE" ]]; then
+  ALT="$(cd "$TESTS_DIR/../../dlp-encrypt/tests" 2>/dev/null && pwd)/KEY-HEX"
+  if [[ -f "$ALT" ]]; then
+    KEY_FILE="$ALT"
+  else
+    echo "Error: KEY-HEX not found in $TESTS_DIR" >&2
+    exit 1
+  fi
+fi
+KEY_HEX="$(cat "$KEY_FILE")"
+
+MIME_TYPE="application/octet-stream"
+case "${INPUT##*.}" in
+  docx) MIME_TYPE="application/vnd.openxmlformats-officedocument.wordprocessingml.document" ;;
+  txt) MIME_TYPE="text/plain" ;;
+  pdf) MIME_TYPE="application/pdf" ;;
+esac
+
+export DECRYPTION_KEY_HEX="$KEY_HEX"
+
+exec "$ROOT/.venv/bin/python3" - "$INPUT" "$OUTPUT" "$MIME_TYPE" <<'PY'
+import sys
+from pathlib import Path
+
+from dlp_mcp.decrypt import decrypt_aes_gcm
+
+input_path = Path(sys.argv[1])
+output_path = Path(sys.argv[2])
+mime_type = sys.argv[3]
+
+key = bytes.fromhex(__import__("os").environ["DECRYPTION_KEY_HEX"])
+payload = input_path.read_bytes()
+temp_dir = input_path.parent / ".tmp"
+
+result = decrypt_aes_gcm(
+    ciphertext=payload,
+    key=key,
+    filename=output_path.name,
+    mime_type=mime_type,
+    temp_dir=temp_dir,
+)
+
+output_path.write_bytes(result.plaintext)
+print(f"Decrypted -> {output_path}")
+print(f"Size: {len(result.plaintext)} bytes")
+print(f"Temp: {result.temp_path}")
+if mime_type.startswith("text/"):
+    print(f"Content:\n{result.plaintext.decode()}")
+PY
