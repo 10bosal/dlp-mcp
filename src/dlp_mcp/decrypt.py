@@ -67,8 +67,14 @@ def decrypt_aes_gcm(
 
 
 def decode_base64_payload(data_b64: str) -> bytes:
-    """Decode standard or URL-safe base64 payload."""
+    """Decode standard, URL-safe, or RFC 2397 data-URI base64 payload."""
     normalized = data_b64.strip()
+    if normalized.startswith("data:"):
+        marker = ";base64,"
+        if marker not in normalized:
+            raise DecryptionError("Unsupported data URI without base64 encoding")
+        normalized = normalized.split(marker, 1)[1]
+
     padding = "=" * (-len(normalized) % 4)
     try:
         return base64.b64decode(normalized + padding, validate=False)

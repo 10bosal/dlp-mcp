@@ -7,7 +7,9 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, ConfigDict
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
@@ -42,8 +44,10 @@ def _transport_security() -> TransportSecuritySettings:
 mcp = FastMCP(
     "DLP",
     instructions=(
-        "Use decrypt_file to decrypt AES-GCM encrypted documents provided by the user. "
-        "Pass encrypted_data_b64, filename, and mime_type when available."
+        "Use decrypt_file when the user uploads an AES-GCM encrypted document. "
+        "Always pass the uploaded file as encrypted_file. "
+        "Do not pass local file paths. "
+        "Use encrypted_data_b64 only when no uploaded file reference is available."
     ),
     stateless_http=True,
     json_response=True,
@@ -51,13 +55,46 @@ mcp = FastMCP(
 )
 
 
+class EncryptedFileRef(BaseModel):
+    """ChatGPT file reference for an uploaded encrypted document."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    download_url: str
+    file_id: str
+    mime_type: str | None = None
+    file_name: str | None = None
+
+
 def _load_settings() -> Settings:
     return Settings.from_env()
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def _load_encrypted_bytes(
+  encrypted_file: EncryptedFileRef | None,
+  encrypted_data_b64: str | None,
+) -> bytes:
+    if encrypted_file is not None:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            response = await client.get(encrypted_file.download_url)
+            response.raise_for_status()
+            return response.content
+
+    if encrypted_data_b64:
+        return decode_base64_payload(encrypted_data_b64)
+
+    raise DecryptionError(
+        "Provide encrypted_file for uploaded documents or encrypted_data_b64 for inline ciphertext"
+    )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+    meta={"openai/fileParams": ["encrypted_file"]},
+)
 async def decrypt_file(
-    encrypted_data_b64: str,
+    encrypted_file: EncryptedFileRef | None = None,
+    encrypted_data_b64: str | None = None,
     filename: str = "decrypted.bin",
     mime_type: str | None = None,
     nonce_b64: str | None = None,
@@ -66,22 +103,22 @@ async def decrypt_file(
     """
     Decrypt an AES-GCM encrypted file and return the plaintext for ChatGPT inference.
 
-    Args:
-        encrypted_data_b64: Base64-encoded encrypted file bytes.
-            Default format: [12-byte nonce][ciphertext + auth tag].
-        filename: Original filename (used for temp storage and response metadata).
-        mime_type: Optional MIME type hint (e.g. text/plain, application/pdf).
-        nonce_b64: Optional base64 nonce when not embedded in ciphertext.
-        associated_data_b64: Optional base64 AAD for AES-GCM.
+    Use this when the user uploads an encrypted document (.enc or encrypted .docx).
+    Pass the uploaded file as encrypted_file. Do not pass local file paths.
 
-    Returns:
-        Decrypted content as base64, temp file path, size, and metadata.
-    """
+    Encrypted format: [12-byte nonce][ciphertext + 16-byte auth tag].
+  """
     settings = _load_settings()
 
+    if encrypted_file is not None:
+        if not filename or filename == "decrypted.bin":
+            filename = encrypted_file.file_name or filename
+        if mime_type is None:
+            mime_type = encrypted_file.mime_type
+
     try:
-        ciphertext = decode_base64_payload(encrypted_data_b64)
-    except DecryptionError as exc:
+        ciphertext = await _load_encrypted_bytes(encrypted_file, encrypted_data_b64)
+    except (DecryptionError, httpx.HTTPError) as exc:
         return {"success": False, "error": str(exc)}
 
     max_bytes = settings.max_file_size_mb * 1024 * 1024
