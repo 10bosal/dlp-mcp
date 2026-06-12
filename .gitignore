@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 venv/
 .env
+.fly-secrets.local
 .pytest_cache/
 .ruff_cache/
 dist/

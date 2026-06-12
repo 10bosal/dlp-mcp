@@ -8,6 +8,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
@@ -163,12 +164,13 @@ async def lifespan(app: Starlette):
 def create_app() -> Starlette:
     settings = _load_settings()
 
-    async def auth_middleware(request: Request, call_next):
-        if request.url.path in ("/health",):
+    class AuthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            if request.url.path in ("/health",):
+                return await call_next(request)
+            if not _verify_api_key(request, settings):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
             return await call_next(request)
-        if not _verify_api_key(request, settings):
-            return JSONResponse({"error": "Unauthorized"}, status_code=401)
-        return await call_next(request)
 
     app = Starlette(
         routes=[
@@ -176,9 +178,8 @@ def create_app() -> Starlette:
             Mount("/", app=mcp.streamable_http_app()),
         ],
         lifespan=lifespan,
-        middleware=[],  # type: ignore[arg-type]
     )
-    app.middleware("http")(auth_middleware)
+    app.add_middleware(AuthMiddleware)
     return app
 
 
