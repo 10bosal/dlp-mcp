@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -23,10 +26,28 @@ from dlp_mcp.decrypt import (
 
 logger = logging.getLogger(__name__)
 
+
+def _transport_security() -> TransportSecuritySettings:
+    default_hosts = "dlp-mcp.fly.dev,localhost,127.0.0.1"
+    default_origins = "https://chatgpt.com,https://chat.openai.com,https://www.chatgpt.com"
+    hosts = os.environ.get("MCP_ALLOWED_HOSTS", default_hosts)
+    origins = os.environ.get("MCP_ALLOWED_ORIGINS", default_origins)
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[host.strip() for host in hosts.split(",") if host.strip()],
+        allowed_origins=[origin.strip() for origin in origins.split(",") if origin.strip()],
+    )
+
+
 mcp = FastMCP(
     "DLP",
+    instructions=(
+        "Use decrypt_file to decrypt AES-GCM encrypted documents provided by the user. "
+        "Pass encrypted_data_b64, filename, and mime_type when available."
+    ),
     stateless_http=True,
     json_response=True,
+    transport_security=_transport_security(),
 )
 
 
@@ -34,7 +55,7 @@ def _load_settings() -> Settings:
     return Settings.from_env()
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def decrypt_file(
     encrypted_data_b64: str,
     filename: str = "decrypted.bin",
@@ -100,7 +121,7 @@ async def decrypt_file(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
 async def cleanup_temp_files() -> dict[str, Any]:
     """Remove expired temporary decrypted files from the server temp directory."""
     settings = _load_settings()
