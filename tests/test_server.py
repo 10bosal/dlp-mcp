@@ -8,7 +8,7 @@ import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from dlp_mcp.decrypt import DecryptionError, decode_base64_payload, extract_docx_text
-from dlp_mcp.server import EncryptedFileRef, decrypt_file, decrypt_sharepoint_file
+from dlp_mcp.server import EncryptedFileRef, decrypt_file
 
 
 @pytest.fixture
@@ -66,27 +66,6 @@ def test_decrypt_file_with_uploaded_file_ref(mock_fetch, aes_key, tmp_path, monk
     assert result["content_text"] == "hello via file ref"
     assert result["download_url"].startswith("https://")
     assert result["file_uri"]["file_name"] == "sample.txt"
-
-
-@patch("dlp_mcp.server.fetch_document_bytes", new_callable=AsyncMock)
-def test_decrypt_sharepoint_file(mock_fetch, aes_key, tmp_path, monkeypatch):
-    monkeypatch.setenv("TEMP_DIR", str(tmp_path))
-    plaintext = b"hello sharepoint"
-    nonce = os.urandom(12)
-    encrypted = nonce + AESGCM(aes_key).encrypt(nonce, plaintext, None)
-    mock_fetch.return_value = (encrypted, "answers_enc.docx")
-
-    result = asyncio.run(
-        decrypt_sharepoint_file(
-            document_url="https://contoso.sharepoint.com/sites/demo/answers_enc.docx",
-            filename="answers.docx",
-            mime_type="text/plain",
-        )
-    )
-
-    assert result["success"] is True
-    assert result["content_text"] == "hello sharepoint"
-    mock_fetch.assert_awaited_once()
 
 
 @patch("dlp_mcp.server.fetch_document_bytes", new_callable=AsyncMock)

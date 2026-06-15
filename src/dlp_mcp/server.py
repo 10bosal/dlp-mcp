@@ -323,42 +323,6 @@ async def decrypt_file(
     )
 
 
-@mcp.tool(
-    title="Decrypt DLP file from SharePoint URL",
-    description="Legacy alias for decrypt_file(document_url=...). Prefer decrypt_file.",
-    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
-    meta={
-        "ui": {"visibility": ["app"]},
-        "openai/toolInvocation/invoking": "SharePoint 문서 복호화 중…",
-        "openai/toolInvocation/invoked": "복호화 완료",
-    },
-)
-async def decrypt_sharepoint_file(
-    document_url: str,
-    filename: str | None = None,
-    mime_type: str | None = None,
-    access_token: str | None = None,
-    nonce_b64: str | None = None,
-    associated_data_b64: str | None = None,
-) -> dict[str, Any]:
-    """
-    Decrypt an AES-GCM encrypted document from a SharePoint, OneDrive, or M365 link.
-
-    Prefer decrypt_file with encrypted_file when the document is already available in chat.
-    Use this only when you have a document_url and no chat file attachment yet.
-
-    Encrypted format: [12-byte nonce][ciphertext + 16-byte auth tag].
-    """
-    return await decrypt_file(
-        document_url=document_url,
-        filename=filename or "decrypted.bin",
-        mime_type=mime_type,
-        access_token=access_token,
-        nonce_b64=nonce_b64,
-        associated_data_b64=associated_data_b64,
-    )
-
-
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
 async def cleanup_temp_files() -> dict[str, Any]:
     """Remove expired temporary decrypted files from the server temp directory."""
