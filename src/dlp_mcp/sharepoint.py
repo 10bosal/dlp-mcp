@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import base64
 import re
+import time
+from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlparse
 
 import httpx
+
+if TYPE_CHECKING:
+    from dlp_mcp.config import AzureGraphSettings
+
+_CLIENT_CREDENTIALS_CACHE: tuple[str, float] | None = None
 
 
 class SharePointDownloadError(Exception):
@@ -66,32 +73,120 @@ def _filename_from_content_disposition(header: str | None) -> str | None:
     return unquote(match.group(1).strip())
 
 
+def m365_auth_required_message(url: str, status_code: int) -> str:
+    host = urlparse(url).netloc or "SharePoint"
+    return (
+        f"{host} returned {status_code} Forbidden. Private Microsoft 365 sharing links cannot be "
+        "downloaded anonymously. Configure AZURE_TENANT_ID, AZURE_CLIENT_ID, and "
+        "AZURE_CLIENT_SECRET on the DLP MCP server with Microsoft Graph application permissions "
+        "(Sites.Read.All or Files.Read.All), enable Microsoft OAuth on the ChatGPT MCP connector, "
+        "or call decrypt_file with encrypted_file after ChatGPT SharePoint connector fetches the file."
+    )
+
+
+async def fetch_client_credentials_token(azure: AzureGraphSettings) -> str:
+    global _CLIENT_CREDENTIALS_CACHE
+
+    now = time.time()
+    if _CLIENT_CREDENTIALS_CACHE and _CLIENT_CREDENTIALS_CACHE[1] > now:
+        return _CLIENT_CREDENTIALS_CACHE[0]
+
+    token_url = f"https://login.microsoftonline.com/{azure.tenant_id}/oauth2/v2.0/token"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                token_url,
+                data={
+                    "client_id": azure.client_id,
+                    "client_secret": azure.client_secret,
+                    "scope": "https://graph.microsoft.com/.default",
+                    "grant_type": "client_credentials",
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except httpx.HTTPError as exc:
+        raise SharePointDownloadError(f"Failed to acquire Microsoft Graph token: {exc}") from exc
+
+    token = payload.get("access_token")
+    if not token:
+        raise SharePointDownloadError("Microsoft Graph token response did not include access_token")
+
+    expires_in = int(payload.get("expires_in", 3600))
+    _CLIENT_CREDENTIALS_CACHE = (token, now + max(expires_in - 120, 60))
+    return token
+
+
+async def resolve_graph_access_token(
+    *,
+    explicit_token: str | None = None,
+    azure: AzureGraphSettings | None = None,
+) -> str | None:
+    if explicit_token:
+        return explicit_token
+
+    try:
+        from mcp.server.auth.middleware.auth_context import get_access_token
+
+        oauth_token = get_access_token()
+        if oauth_token is not None:
+            return oauth_token.token
+    except Exception:
+        pass
+
+    if azure is not None:
+        return await fetch_client_credentials_token(azure)
+
+    return None
+
+
+def _graph_content_url(url: str) -> str:
+    return (
+        "https://graph.microsoft.com/v1.0/shares/"
+        f"{graph_share_id(url)}/driveItem/content"
+    )
+
+
 async def fetch_document_bytes(
     url: str,
     *,
     access_token: str | None = None,
+    azure: AzureGraphSettings | None = None,
 ) -> tuple[bytes, str | None]:
     """
     Download document bytes from a SharePoint, OneDrive, or HTTPS URL.
 
-    When access_token is provided for an M365 URL, Microsoft Graph is used.
+    M365 sharing links use Microsoft Graph when a token is available from the tool
+    argument, MCP OAuth context, or configured Azure application credentials.
     """
-    headers: dict[str, str] = {}
     fetch_url = url.strip()
-
-    if access_token and is_m365_document_url(fetch_url):
-        fetch_url = (
-            "https://graph.microsoft.com/v1.0/shares/"
-            f"{graph_share_id(fetch_url)}/driveItem/content"
-        )
-        headers["Authorization"] = f"Bearer {access_token}"
-    else:
-        fetch_url = normalize_document_url(fetch_url)
+    graph_token = await resolve_graph_access_token(explicit_token=access_token, azure=azure)
 
     try:
         async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
-            response = await client.get(fetch_url, headers=headers)
+            if is_m365_document_url(fetch_url) and graph_token:
+                response = await client.get(
+                    _graph_content_url(fetch_url),
+                    headers={"Authorization": f"Bearer {graph_token}"},
+                )
+            elif is_m365_document_url(fetch_url):
+                response = await client.get(normalize_document_url(fetch_url))
+            else:
+                response = await client.get(fetch_url)
+
+            if response.status_code in (401, 403) and is_m365_document_url(fetch_url):
+                raise SharePointDownloadError(
+                    m365_auth_required_message(fetch_url, response.status_code)
+                )
+
             response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if is_m365_document_url(fetch_url) and status in (401, 403):
+            raise SharePointDownloadError(
+                m365_auth_required_message(fetch_url, status)
+            ) from exc
+        raise SharePointDownloadError(f"Failed to download document: {exc}") from exc
     except httpx.HTTPError as exc:
         raise SharePointDownloadError(f"Failed to download document: {exc}") from exc
 

@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class AzureGraphSettings:
+    tenant_id: str
+    client_id: str
+    client_secret: str
 
 
 @dataclass(frozen=True)
@@ -14,6 +22,7 @@ class Settings:
     api_key: str | None
     max_file_size_mb: int
     temp_ttl_seconds: int
+    azure_graph: AzureGraphSettings | None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -32,10 +41,29 @@ class Settings:
         temp_dir = Path(os.environ.get("TEMP_DIR", "/tmp/dlp-mcp"))
         api_key = os.environ.get("MCP_API_KEY") or None
 
+        tenant_id = os.environ.get("AZURE_TENANT_ID", "").strip()
+        client_id = os.environ.get("AZURE_CLIENT_ID", "").strip()
+        client_secret = os.environ.get("AZURE_CLIENT_SECRET", "").strip()
+        azure_values = [tenant_id, client_id, client_secret]
+        if any(azure_values) and not all(azure_values):
+            raise ValueError(
+                "AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET must all be set together"
+            )
+        azure_graph = (
+            AzureGraphSettings(
+                tenant_id=tenant_id,
+                client_id=client_id,
+                client_secret=client_secret,
+            )
+            if all(azure_values)
+            else None
+        )
+
         return cls(
             decryption_key=key,
             temp_dir=temp_dir,
             api_key=api_key,
             max_file_size_mb=int(os.environ.get("MAX_FILE_SIZE_MB", "50")),
             temp_ttl_seconds=int(os.environ.get("TEMP_TTL_SECONDS", "3600")),
+            azure_graph=azure_graph,
         )

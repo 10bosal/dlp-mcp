@@ -53,8 +53,8 @@ mcp = FastMCP(
         "AES-GCM ciphertext, NOT Microsoft Office password-protected documents. "
         "When SharePoint or a chat attachment shows null/unreadable content for such files, "
         "call decrypt_file immediately with encrypted_file (file already in chat) or document_url "
-        "(only a SharePoint/M365 link). Do not read encrypted files directly. "
-        "Use content_text from the tool result for document body."
+        "(SharePoint/M365 link; requires Microsoft Graph auth for private tenants). "
+        "Do not read encrypted files directly. Use content_text from the tool result for document body."
     ),
     stateless_http=True,
     json_response=True,
@@ -124,20 +124,26 @@ def _extract_readable_text(data: bytes, filename: str, mime_type: str | None) ->
 
 async def _load_encrypted_bytes(
     *,
+    settings: Settings,
     encrypted_file: EncryptedFileRef | dict[str, Any] | str | None = None,
     document_url: str | None = None,
     encrypted_data_b64: str | None = None,
     access_token: str | None = None,
 ) -> tuple[bytes, str | None]:
     file_ref = _coerce_encrypted_file(encrypted_file)
+    azure = settings.azure_graph
     if file_ref is not None:
-        content, detected_name = await fetch_document_bytes(file_ref.download_url)
+        content, detected_name = await fetch_document_bytes(
+            file_ref.download_url,
+            azure=azure,
+        )
         return content, detected_name or file_ref.file_name
 
     if document_url:
         content, detected_name = await fetch_document_bytes(
             document_url,
             access_token=access_token,
+            azure=azure,
         )
         return content, detected_name
 
@@ -218,8 +224,8 @@ _DECRYPT_FILE_DESCRIPTION = (
     "Decrypt DLP AES-256-GCM encrypted documents (for example *_enc.docx, *.enc). "
     "The server holds the key; never ask the user for a password. "
     "This is NOT Microsoft Office password protection. "
-    "When SharePoint shows null content for an *_enc* file, call this tool with encrypted_file "
-    "or document_url instead of reading the file directly."
+    "For private SharePoint/M365 links, Microsoft Graph authentication is required; "
+    "prefer encrypted_file when ChatGPT SharePoint connector already fetched the file."
 )
 
 
@@ -231,6 +237,13 @@ _DECRYPT_FILE_DESCRIPTION = (
         "openai/fileParams": ["encrypted_file"],
         "openai/toolInvocation/invoking": "DLP 문서 복호화 중…",
         "openai/toolInvocation/invoked": "복호화 완료",
+        "securitySchemes": [
+            {"type": "noauth"},
+            {
+                "type": "oauth2",
+                "scopes": ["Files.Read.All", "Sites.Read.All", "Files.Read"],
+            },
+        ],
     },
 )
 async def decrypt_file(
@@ -264,6 +277,7 @@ async def decrypt_file(
 
     try:
         ciphertext, detected_name = await _load_encrypted_bytes(
+            settings=settings,
             encrypted_file=encrypted_file,
             document_url=document_url,
             encrypted_data_b64=encrypted_data_b64,
