@@ -83,15 +83,8 @@ async def test_fetch_document_bytes_403_returns_actionable_error():
         new_callable=AsyncMock,
         return_value=None,
     ):
-        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
-            mock_response = httpx.Response(
-                403,
-                request=httpx.Request("GET", share_url),
-            )
-            mock_get.return_value = mock_response
-
-            with pytest.raises(SharePointDownloadError, match="403 Forbidden"):
-                await fetch_document_bytes(share_url)
+        with pytest.raises(SharePointDownloadError, match="Azure credentials"):
+            await fetch_document_bytes(share_url)
 
 
 @pytest.mark.asyncio

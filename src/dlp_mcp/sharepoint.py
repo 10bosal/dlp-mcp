@@ -73,14 +73,16 @@ def _filename_from_content_disposition(header: str | None) -> str | None:
     return unquote(match.group(1).strip())
 
 
-def m365_auth_required_message(url: str, status_code: int) -> str:
+def m365_auth_required_message(url: str, status_code: int | None = None) -> str:
     host = urlparse(url).netloc or "SharePoint"
+    status_hint = f"{status_code} " if status_code else ""
     return (
-        f"{host} returned {status_code} Forbidden. Private Microsoft 365 sharing links cannot be "
-        "downloaded anonymously. Configure AZURE_TENANT_ID, AZURE_CLIENT_ID, and "
-        "AZURE_CLIENT_SECRET on the DLP MCP server with Microsoft Graph application permissions "
-        "(Sites.Read.All or Files.Read.All), enable Microsoft OAuth on the ChatGPT MCP connector, "
-        "or call decrypt_file with encrypted_file after ChatGPT SharePoint connector fetches the file."
+        f"{host} requires Microsoft Graph authentication ({status_hint}private M365 link). "
+        "The DLP MCP server does not have Azure credentials configured yet. "
+        "An administrator must set AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET "
+        "on fly.io with Graph application permissions Sites.Read.All or Files.Read.All. "
+        "Until then, upload the *_enc* file in ChatGPT and call decrypt_file with encrypted_file, "
+        "or ask ChatGPT SharePoint connector to fetch the file first and bind it to encrypted_file."
     )
 
 
@@ -162,6 +164,9 @@ async def fetch_document_bytes(
     fetch_url = url.strip()
     graph_token = await resolve_graph_access_token(explicit_token=access_token, azure=azure)
 
+    if is_m365_document_url(fetch_url) and not graph_token:
+        raise SharePointDownloadError(m365_auth_required_message(fetch_url))
+
     try:
         async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
             if is_m365_document_url(fetch_url) and graph_token:
@@ -169,8 +174,6 @@ async def fetch_document_bytes(
                     _graph_content_url(fetch_url),
                     headers={"Authorization": f"Bearer {graph_token}"},
                 )
-            elif is_m365_document_url(fetch_url):
-                response = await client.get(normalize_document_url(fetch_url))
             else:
                 response = await client.get(fetch_url)
 
