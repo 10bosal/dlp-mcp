@@ -115,6 +115,27 @@ def test_coerce_encrypted_file_rejects_bare_file_id():
         _coerce_encrypted_file({"file_id": "file-abc"})
 
 
+def test_coerce_encrypted_file_accepts_camel_case():
+    from dlp_mcp.server import _coerce_encrypted_file
+
+    ref = _coerce_encrypted_file(
+        {
+            "fileId": "file-abc",
+            "downloadUrl": "https://files.example/answers.enc",
+            "fileName": "answers_enc.docx",
+        }
+    )
+    assert ref.file_id == "file-abc"
+    assert ref.download_url == "https://files.example/answers.enc"
+    assert ref.file_name == "answers_enc.docx"
+
+
+def test_decrypt_file_without_input_returns_error(aes_key):
+    result = asyncio.run(decrypt_file())
+    assert result["success"] is False
+    assert "No input provided" in result["error"]
+
+
 def test_extract_docx_text_from_decrypted_file():
     docx_path = Path(__file__).resolve().parents[2] / "dlp-encrypt/tests/answers.docx"
     if not docx_path.is_file():

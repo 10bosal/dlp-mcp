@@ -47,14 +47,13 @@ def _transport_security() -> TransportSecuritySettings:
 mcp = FastMCP(
     "DLP Decrypt",
     instructions=(
-        "This server decrypts DLP AES-256-GCM encrypted files. The decryption key is configured "
-        "on the server; never ask the user for a password, Office password, or encryption method. "
-        "Files named *_enc* (for example 2026_Wordcup_result_enc.docx) or *.enc are whole-file "
-        "AES-GCM ciphertext, NOT Microsoft Office password-protected documents. "
-        "When SharePoint or a chat attachment shows null/unreadable content for such files, "
-        "call decrypt_file immediately with encrypted_file (file already in chat) or document_url "
-        "(SharePoint/M365 link; requires Microsoft Graph auth for private tenants). "
-        "Do not read encrypted files directly. Use content_text from the tool result for document body."
+        "Always invoke decrypt_file when the user asks to decrypt a DLP *_enc* file. "
+        "Do not claim the tool is missing until decrypt_file has been called in this chat. "
+        "The decryption key is on the server; never ask the user for a password. "
+        "Files named *_enc* are AES-GCM ciphertext, not Office password protection. "
+        "Preferred inputs: (1) encrypted_file for chat or SharePoint-fetched files, "
+        "(2) document_url using the SharePoint link from the user's message. "
+        "After decrypt_file succeeds, summarize content_text."
     ),
     stateless_http=True,
     json_response=True,
@@ -73,6 +72,20 @@ class EncryptedFileRef(BaseModel):
     file_name: str | None = None
 
 
+def _normalize_file_dict(value: dict[str, Any]) -> dict[str, Any]:
+    aliases = {
+        "fileId": "file_id",
+        "downloadUrl": "download_url",
+        "fileName": "file_name",
+        "mimeType": "mime_type",
+    }
+    normalized = dict(value)
+    for src, dest in aliases.items():
+        if src in normalized and dest not in normalized:
+            normalized[dest] = normalized[src]
+    return normalized
+
+
 def _coerce_encrypted_file(value: EncryptedFileRef | dict[str, Any] | str | None) -> EncryptedFileRef | None:
     if value is None:
         return None
@@ -80,15 +93,17 @@ def _coerce_encrypted_file(value: EncryptedFileRef | dict[str, Any] | str | None
         return value
     if isinstance(value, str):
         raise DecryptionError(
-            "encrypted_file must be passed as a ChatGPT file attachment, not a local path or bare file id"
+            "encrypted_file was not attached by ChatGPT. Re-run decrypt_file and bind the chat file "
+            "to encrypted_file, or pass document_url with the SharePoint link from the user message."
         )
     if isinstance(value, dict):
-        if value.get("file_id") and not value.get("download_url"):
+        normalized = _normalize_file_dict(value)
+        if normalized.get("file_id") and not normalized.get("download_url"):
             raise DecryptionError(
                 "encrypted_file is missing download_url. Re-run decrypt_file with the chat file "
-                "attached as encrypted_file so ChatGPT can supply a downloadable file reference."
+                "bound to encrypted_file, or pass document_url with the SharePoint link."
             )
-        return EncryptedFileRef.model_validate(value)
+        return EncryptedFileRef.model_validate(normalized)
     raise DecryptionError(f"Unsupported encrypted_file type: {type(value).__name__}")
 
 
@@ -221,29 +236,21 @@ async def _decrypt_ciphertext(
 
 
 _DECRYPT_FILE_DESCRIPTION = (
-    "Decrypt DLP AES-256-GCM encrypted documents (for example *_enc.docx, *.enc). "
-    "The server holds the key; never ask the user for a password. "
-    "This is NOT Microsoft Office password protection. "
-    "For private SharePoint/M365 links, Microsoft Graph authentication is required; "
-    "prefer encrypted_file when ChatGPT SharePoint connector already fetched the file."
+    "Decrypt DLP AES-256-GCM encrypted documents (for example *_enc.docx). "
+    "Server-side key; never ask the user for a password. "
+    "Call this tool when a SharePoint *_enc* file is already in chat (encrypted_file) "
+    "or when the user provided a SharePoint/M365 link (document_url)."
 )
 
 
 @mcp.tool(
     title="Decrypt DLP encrypted file",
     description=_DECRYPT_FILE_DESCRIPTION,
-    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True),
     meta={
         "openai/fileParams": ["encrypted_file"],
         "openai/toolInvocation/invoking": "DLP 문서 복호화 중…",
         "openai/toolInvocation/invoked": "복호화 완료",
-        "securitySchemes": [
-            {"type": "noauth"},
-            {
-                "type": "oauth2",
-                "scopes": ["Files.Read.All", "Sites.Read.All", "Files.Read"],
-            },
-        ],
     },
 )
 async def decrypt_file(
@@ -274,6 +281,22 @@ async def decrypt_file(
             filename = file_ref.file_name or filename
         if mime_type is None:
             mime_type = file_ref.mime_type
+
+    if not file_ref and not document_url and not encrypted_data_b64:
+        return {
+            "success": False,
+            "error": (
+                "No input provided. Pass encrypted_file for a chat/SharePoint file, "
+                "or document_url with the SharePoint link from the user message."
+            ),
+        }
+
+    logger.info(
+        "decrypt_file called (encrypted_file=%s, document_url=%s, filename=%s)",
+        bool(file_ref),
+        bool(document_url),
+        filename,
+    )
 
     try:
         ciphertext, detected_name = await _load_encrypted_bytes(
