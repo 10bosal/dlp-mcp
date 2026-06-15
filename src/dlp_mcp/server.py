@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -19,6 +20,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from dlp_mcp.config import Settings
+from dlp_mcp.temp_cleanup import cleanup_expired_temp_files, temp_cleanup_worker
 from dlp_mcp.sharepoint import SharePointDownloadError, fetch_document_bytes
 from dlp_mcp.decrypt import (
     DecryptionError,
@@ -327,25 +329,8 @@ async def decrypt_file(
 async def cleanup_temp_files() -> dict[str, Any]:
     """Remove expired temporary decrypted files from the server temp directory."""
     settings = _load_settings()
-    settings.temp_dir.mkdir(parents=True, exist_ok=True)
-
-    now = time.time()
-    removed: list[str] = []
-    errors: list[str] = []
-
-    for path in settings.temp_dir.iterdir():
-        if not path.is_file():
-            continue
-        age = now - path.stat().st_mtime
-        if age < settings.temp_ttl_seconds:
-            continue
-        try:
-            path.unlink()
-            removed.append(path.name)
-        except OSError as exc:
-            errors.append(f"{path.name}: {exc}")
-
-    return {"success": True, "removed": removed, "errors": errors}
+    result = cleanup_expired_temp_files(settings)
+    return {"success": True, "removed": result.removed, "errors": result.errors}
 
 
 def _maybe_decode_text(data: bytes, mime_type: str | None) -> str | None:
@@ -398,9 +383,19 @@ async def lifespan(app: Starlette):
     settings = _load_settings()
     settings.temp_dir.mkdir(parents=True, exist_ok=True)
     logger.info("DLP MCP starting — temp_dir=%s", settings.temp_dir)
+
+    stop_cleanup = asyncio.Event()
+    cleanup_task = asyncio.create_task(temp_cleanup_worker(settings, stop_cleanup))
+
     async with contextlib.AsyncExitStack() as stack:
         await stack.enter_async_context(mcp.session_manager.run())
-        yield
+        try:
+            yield
+        finally:
+            stop_cleanup.set()
+            cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cleanup_task
 
 
 def create_app() -> Starlette:

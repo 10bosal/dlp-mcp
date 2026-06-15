@@ -22,6 +22,7 @@ class Settings:
     api_key: str | None
     max_file_size_mb: int
     temp_ttl_seconds: int
+    temp_cleanup_interval_seconds: int
     azure_graph: AzureGraphSettings | None
 
     @classmethod
@@ -65,5 +66,8 @@ class Settings:
             api_key=api_key,
             max_file_size_mb=int(os.environ.get("MAX_FILE_SIZE_MB", "50")),
             temp_ttl_seconds=int(os.environ.get("TEMP_TTL_SECONDS", "3600")),
+            temp_cleanup_interval_seconds=int(
+                os.environ.get("TEMP_CLEANUP_INTERVAL_SECONDS", "3600")
+            ),
             azure_graph=azure_graph,
         )

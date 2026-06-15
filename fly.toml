@@ -12,6 +12,7 @@ primary_region = 'nrt'
   MAX_FILE_SIZE_MB = '50'
   TEMP_DIR = '/tmp/dlp-mcp'
   TEMP_TTL_SECONDS = '3600'
+  TEMP_CLEANUP_INTERVAL_SECONDS = '3600'
 
 [http_service]
   internal_port = 8000
