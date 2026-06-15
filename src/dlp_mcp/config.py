@@ -23,6 +23,8 @@ class Settings:
     max_file_size_mb: int
     temp_ttl_seconds: int
     temp_cleanup_interval_seconds: int
+    audit_log_path: Path
+    audit_retention_seconds: int
     azure_graph: AzureGraphSettings | None
 
     @classmethod
@@ -40,6 +42,8 @@ class Settings:
             raise ValueError("DECRYPTION_KEY_HEX must decode to 16, 24, or 32 bytes (AES key)")
 
         temp_dir = Path(os.environ.get("TEMP_DIR", "/tmp/dlp-mcp"))
+        audit_dir = Path(os.environ.get("AUDIT_DIR", str(temp_dir / "audit")))
+        audit_log_path = audit_dir / "audit.jsonl"
         api_key = os.environ.get("MCP_API_KEY") or None
 
         tenant_id = os.environ.get("AZURE_TENANT_ID", "").strip()
@@ -68,6 +72,10 @@ class Settings:
             temp_ttl_seconds=int(os.environ.get("TEMP_TTL_SECONDS", "3600")),
             temp_cleanup_interval_seconds=int(
                 os.environ.get("TEMP_CLEANUP_INTERVAL_SECONDS", "3600")
+            ),
+            audit_log_path=audit_log_path,
+            audit_retention_seconds=int(
+                os.environ.get("AUDIT_RETENTION_SECONDS", str(30 * 24 * 3600))
             ),
             azure_graph=azure_graph,
         )

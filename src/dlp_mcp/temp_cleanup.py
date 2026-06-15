@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 
 from dlp_mcp.config import Settings
+from dlp_mcp.audit import get_audit_log
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,11 @@ async def temp_cleanup_worker(settings: Settings, stop: asyncio.Event) -> None:
             logger.info("Auto-removed %d expired temp file(s)", len(result.removed))
         for error in result.errors:
             logger.warning("Temp cleanup error: %s", error)
+
+        if settings.audit_retention_seconds > 0:
+            removed_audit = get_audit_log(settings).cleanup_expired(settings.audit_retention_seconds)
+            if removed_audit:
+                logger.info("Auto-removed %d expired audit record(s)", removed_audit)
 
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)

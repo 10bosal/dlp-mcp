@@ -20,6 +20,8 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from dlp_mcp.config import Settings
+from dlp_mcp.audit import get_audit_log, new_audit_record
+from dlp_mcp.request_context import audit_caller_fields, bind_caller_info, extract_caller_info, reset_caller_info
 from dlp_mcp.temp_cleanup import cleanup_expired_temp_files, temp_cleanup_worker
 from dlp_mcp.sharepoint import SharePointDownloadError, fetch_document_bytes
 from dlp_mcp.decrypt import (
@@ -107,6 +109,50 @@ def _coerce_encrypted_file(value: EncryptedFileRef | dict[str, Any] | str | None
             )
         return EncryptedFileRef.model_validate(normalized)
     raise DecryptionError(f"Unsupported encrypted_file type: {type(value).__name__}")
+
+
+def _resolve_decrypt_input_meta(
+    *,
+    file_ref: EncryptedFileRef | None,
+    document_url: str | None,
+    encrypted_data_b64: str | None,
+    filename: str,
+) -> tuple[str | None, str]:
+    if file_ref is not None:
+        return "encrypted_file", file_ref.file_name or filename
+    if document_url:
+        basename = document_url.split("?")[0].rstrip("/").split("/")[-1]
+        return "document_url", basename or filename
+    if encrypted_data_b64:
+        return "encrypted_data_b64", filename
+    return None, filename
+
+
+def _record_decrypt_audit(
+    settings: Settings,
+    *,
+    started: float,
+    input_source: str | None,
+    encrypted_filename: str,
+    document_url: str | None,
+    result: dict[str, Any],
+) -> None:
+    duration_ms = (time.monotonic() - started) * 1000
+    get_audit_log(settings).append(
+        new_audit_record(
+            action="decrypt_file",
+            success=bool(result.get("success")),
+            encrypted_filename=encrypted_filename,
+            decrypted_filename=result.get("filename"),
+            input_source=input_source,
+            document_url=document_url,
+            mime_type=result.get("mime_type"),
+            size_bytes=result.get("size_bytes"),
+            error=result.get("error"),
+            duration_ms=round(duration_ms, 2),
+            **audit_caller_fields(),
+        )
+    )
 
 
 def _load_settings() -> Settings:
@@ -276,7 +322,14 @@ async def decrypt_file(
     Format: [12-byte nonce][ciphertext + 16-byte auth tag]. No user password required.
     """
     settings = _load_settings()
+    started = time.monotonic()
     file_ref = _coerce_encrypted_file(encrypted_file)
+    input_source, encrypted_filename = _resolve_decrypt_input_meta(
+        file_ref=file_ref,
+        document_url=document_url,
+        encrypted_data_b64=encrypted_data_b64,
+        filename=filename,
+    )
 
     if file_ref is not None:
         if not filename or filename == "decrypted.bin":
@@ -285,13 +338,22 @@ async def decrypt_file(
             mime_type = file_ref.mime_type
 
     if not file_ref and not document_url and not encrypted_data_b64:
-        return {
+        result = {
             "success": False,
             "error": (
                 "No input provided. Pass encrypted_file for a chat/SharePoint file, "
                 "or document_url with the SharePoint link from the user message."
             ),
         }
+        _record_decrypt_audit(
+            settings,
+            started=started,
+            input_source=input_source,
+            encrypted_filename=encrypted_filename,
+            document_url=document_url,
+            result=result,
+        )
+        return result
 
     logger.info(
         "decrypt_file called (encrypted_file=%s, document_url=%s, filename=%s)",
@@ -309,13 +371,25 @@ async def decrypt_file(
             access_token=access_token,
         )
     except (DecryptionError, SharePointDownloadError, httpx.HTTPError) as exc:
-        return {"success": False, "error": str(exc)}
+        result = {"success": False, "error": str(exc)}
+        _record_decrypt_audit(
+            settings,
+            started=started,
+            input_source=input_source,
+            encrypted_filename=encrypted_filename,
+            document_url=document_url,
+            result=result,
+        )
+        return result
+
+    if detected_name:
+        encrypted_filename = detected_name
 
     resolved_filename = filename
     if resolved_filename == "decrypted.bin" and detected_name:
         resolved_filename = detected_name
 
-    return await _decrypt_ciphertext(
+    result = await _decrypt_ciphertext(
         settings=settings,
         ciphertext=ciphertext,
         filename=resolved_filename,
@@ -323,14 +397,90 @@ async def decrypt_file(
         nonce_b64=nonce_b64,
         associated_data_b64=associated_data_b64,
     )
+    _record_decrypt_audit(
+        settings,
+        started=started,
+        input_source=input_source,
+        encrypted_filename=encrypted_filename,
+        document_url=document_url,
+        result=result,
+    )
+    return result
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
 async def cleanup_temp_files() -> dict[str, Any]:
     """Remove expired temporary decrypted files from the server temp directory."""
     settings = _load_settings()
+    started = time.monotonic()
     result = cleanup_expired_temp_files(settings)
-    return {"success": True, "removed": result.removed, "errors": result.errors}
+    response = {"success": True, "removed": result.removed, "errors": result.errors}
+    duration_ms = (time.monotonic() - started) * 1000
+    get_audit_log(settings).append(
+        new_audit_record(
+            action="cleanup_temp_files",
+            success=True,
+            removed_files=result.removed,
+            errors=result.errors or None,
+            duration_ms=round(duration_ms, 2),
+            **audit_caller_fields(),
+        )
+    )
+    return response
+
+
+@mcp.tool(
+    title="Query audit logs",
+    description=(
+        "Retrieve audit records for decrypt_file and cleanup_temp_files invocations. "
+        "Includes call timestamp, encrypted filename, caller metadata, and errors (no document body)."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False),
+)
+async def query_audit_logs(
+    action: str | None = None,
+    encrypted_filename: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """
+    Query persisted audit logs.
+
+    Filters:
+    - action: decrypt_file | cleanup_temp_files | query_audit_logs
+    - encrypted_filename: case-insensitive substring match
+    - since / until: ISO-8601 UTC timestamps (inclusive)
+    """
+    settings = _load_settings()
+    started = time.monotonic()
+    audit = get_audit_log(settings)
+    entries, total = audit.query(
+        action=action,
+        encrypted_filename=encrypted_filename,
+        since=since,
+        until=until,
+        limit=limit,
+        offset=offset,
+    )
+    response = {
+        "success": True,
+        "total": total,
+        "limit": min(max(limit, 1), 200),
+        "offset": max(offset, 0),
+        "entries": entries,
+    }
+    duration_ms = (time.monotonic() - started) * 1000
+    audit.append(
+        new_audit_record(
+            action="query_audit_logs",
+            success=True,
+            duration_ms=round(duration_ms, 2),
+            **audit_caller_fields(),
+        )
+    )
+    return response
 
 
 def _maybe_decode_text(data: bytes, mime_type: str | None) -> str | None:
@@ -382,6 +532,7 @@ def secrets_compare(a: str, b: str) -> bool:
 async def lifespan(app: Starlette):
     settings = _load_settings()
     settings.temp_dir.mkdir(parents=True, exist_ok=True)
+    get_audit_log(settings).ensure_ready()
     logger.info("DLP MCP starting — temp_dir=%s", settings.temp_dir)
 
     stop_cleanup = asyncio.Event()
@@ -401,6 +552,15 @@ async def lifespan(app: Starlette):
 def create_app() -> Starlette:
     settings = _load_settings()
 
+    class CallerContextMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            caller = extract_caller_info(request)
+            context_token = bind_caller_info(caller)
+            try:
+                return await call_next(request)
+            finally:
+                reset_caller_info(context_token)
+
     class AuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
             if request.url.path in ("/health",) or request.url.path.startswith("/files/"):
@@ -418,6 +578,7 @@ def create_app() -> Starlette:
         lifespan=lifespan,
     )
     app.add_middleware(AuthMiddleware)
+    app.add_middleware(CallerContextMiddleware)
     return app
 
 
