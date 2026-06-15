@@ -2,13 +2,13 @@ import asyncio
 import base64
 import os
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from dlp_mcp.decrypt import decode_base64_payload, extract_docx_text
-from dlp_mcp.server import EncryptedFileRef, decrypt_file
+from dlp_mcp.server import EncryptedFileRef, decrypt_file, decrypt_sharepoint_file
 
 
 @pytest.fixture
@@ -43,19 +43,13 @@ def test_decrypt_file_with_inline_base64(aes_key, tmp_path, monkeypatch):
     assert result["content_text"] == "hello via base64"
 
 
-@patch("dlp_mcp.server.httpx.AsyncClient")
-def test_decrypt_file_with_uploaded_file_ref(mock_client_cls, aes_key, tmp_path, monkeypatch):
+@patch("dlp_mcp.server.fetch_document_bytes", new_callable=AsyncMock)
+def test_decrypt_file_with_uploaded_file_ref(mock_fetch, aes_key, tmp_path, monkeypatch):
     monkeypatch.setenv("TEMP_DIR", str(tmp_path))
     plaintext = b"hello via file ref"
     nonce = os.urandom(12)
     encrypted = nonce + AESGCM(aes_key).encrypt(nonce, plaintext, None)
-
-    mock_client = AsyncMock()
-    mock_client_cls.return_value.__aenter__.return_value = mock_client
-    mock_response = MagicMock()
-    mock_response.content = encrypted
-    mock_response.raise_for_status = MagicMock()
-    mock_client.get = AsyncMock(return_value=mock_response)
+    mock_fetch.return_value = (encrypted, "sample.txt")
 
     result = asyncio.run(
         decrypt_file(
@@ -72,6 +66,27 @@ def test_decrypt_file_with_uploaded_file_ref(mock_client_cls, aes_key, tmp_path,
     assert result["content_text"] == "hello via file ref"
     assert result["download_url"].startswith("https://")
     assert result["file_uri"]["file_name"] == "sample.txt"
+
+
+@patch("dlp_mcp.server.fetch_document_bytes", new_callable=AsyncMock)
+def test_decrypt_sharepoint_file(mock_fetch, aes_key, tmp_path, monkeypatch):
+    monkeypatch.setenv("TEMP_DIR", str(tmp_path))
+    plaintext = b"hello sharepoint"
+    nonce = os.urandom(12)
+    encrypted = nonce + AESGCM(aes_key).encrypt(nonce, plaintext, None)
+    mock_fetch.return_value = (encrypted, "answers_enc.docx")
+
+    result = asyncio.run(
+        decrypt_sharepoint_file(
+            document_url="https://contoso.sharepoint.com/sites/demo/answers_enc.docx",
+            filename="answers.docx",
+            mime_type="text/plain",
+        )
+    )
+
+    assert result["success"] is True
+    assert result["content_text"] == "hello sharepoint"
+    mock_fetch.assert_awaited_once()
 
 
 def test_extract_docx_text_from_decrypted_file():

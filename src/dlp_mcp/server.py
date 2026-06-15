@@ -19,6 +19,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 
 from dlp_mcp.config import Settings
+from dlp_mcp.sharepoint import SharePointDownloadError, fetch_document_bytes
 from dlp_mcp.decrypt import (
     DecryptionError,
     decode_base64_payload,
@@ -45,10 +46,9 @@ def _transport_security() -> TransportSecuritySettings:
 mcp = FastMCP(
     "DLP",
     instructions=(
-        "Use decrypt_file when the user uploads an AES-GCM encrypted document. "
-        "Always pass the uploaded file as encrypted_file. "
-        "Read the answer from content_text when present. "
-        "For binary documents, use file_uri.download_url instead of temp_path."
+        "Use decrypt_file when the user uploads an encrypted document as encrypted_file. "
+        "Use decrypt_sharepoint_file when the user provides a SharePoint, OneDrive, or M365 document link. "
+        "Read answers from content_text when present."
     ),
     stateless_http=True,
     json_response=True,
@@ -100,10 +100,8 @@ async def _load_encrypted_bytes(
     encrypted_data_b64: str | None,
 ) -> bytes:
     if encrypted_file is not None:
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            response = await client.get(encrypted_file.download_url)
-            response.raise_for_status()
-            return response.content
+        content, _ = await fetch_document_bytes(encrypted_file.download_url)
+        return content
 
     if encrypted_data_b64:
         return decode_base64_payload(encrypted_data_b64)
@@ -111,6 +109,70 @@ async def _load_encrypted_bytes(
     raise DecryptionError(
         "Provide encrypted_file for uploaded documents or encrypted_data_b64 for inline ciphertext"
     )
+
+
+def _format_decrypt_result(result, settings: Settings) -> dict[str, Any]:
+    resolved_mime = _guess_mime_type(result.filename, result.mime_type)
+    file_id = result.temp_path.name
+    download_url = f"{_public_base_url()}/files/{file_id}"
+    content_text = _extract_readable_text(result.plaintext, result.filename, resolved_mime)
+
+    return {
+        "success": True,
+        "filename": result.filename,
+        "mime_type": resolved_mime,
+        "size_bytes": len(result.plaintext),
+        "expires_in_seconds": settings.temp_ttl_seconds,
+        "content_b64": encode_base64(result.plaintext),
+        "content_text": content_text,
+        "download_url": download_url,
+        "file_uri": {
+            "download_url": download_url,
+            "file_id": file_id,
+            "mime_type": resolved_mime,
+            "file_name": result.filename,
+        },
+        "message": (
+            "Decryption succeeded. Use content_text for document body. "
+            "If content_text is empty, fetch file_uri.download_url for the decrypted file."
+        ),
+    }
+
+
+async def _decrypt_ciphertext(
+    *,
+    settings: Settings,
+    ciphertext: bytes,
+    filename: str,
+    mime_type: str | None,
+    nonce_b64: str | None = None,
+    associated_data_b64: str | None = None,
+) -> dict[str, Any]:
+    max_bytes = settings.max_file_size_mb * 1024 * 1024
+    if len(ciphertext) > max_bytes:
+        return {
+            "success": False,
+            "error": f"Encrypted payload exceeds {settings.max_file_size_mb}MB limit",
+        }
+
+    nonce = decode_base64_payload(nonce_b64) if nonce_b64 else None
+    aad = decode_base64_payload(associated_data_b64) if associated_data_b64 else None
+
+    try:
+        result = decrypt_aes_gcm(
+            ciphertext=ciphertext,
+            key=settings.decryption_key,
+            nonce=nonce,
+            associated_data=aad,
+            filename=filename,
+            mime_type=mime_type,
+            temp_dir=settings.temp_dir,
+        )
+    except DecryptionError as exc:
+        return {"success": False, "error": str(exc)}
+
+    logger.info("Decrypted file saved to %s (%d bytes)", result.temp_path, len(result.plaintext))
+    return _format_decrypt_result(result, settings)
 
 
 @mcp.tool(
@@ -143,59 +205,55 @@ async def decrypt_file(
 
     try:
         ciphertext = await _load_encrypted_bytes(encrypted_file, encrypted_data_b64)
-    except (DecryptionError, httpx.HTTPError) as exc:
+    except (DecryptionError, SharePointDownloadError, httpx.HTTPError) as exc:
         return {"success": False, "error": str(exc)}
 
-    max_bytes = settings.max_file_size_mb * 1024 * 1024
-    if len(ciphertext) > max_bytes:
-        return {
-            "success": False,
-            "error": f"Encrypted payload exceeds {settings.max_file_size_mb}MB limit",
-        }
+    return await _decrypt_ciphertext(
+        settings=settings,
+        ciphertext=ciphertext,
+        filename=filename,
+        mime_type=mime_type,
+        nonce_b64=nonce_b64,
+        associated_data_b64=associated_data_b64,
+    )
 
-    nonce = decode_base64_payload(nonce_b64) if nonce_b64 else None
-    aad = decode_base64_payload(associated_data_b64) if associated_data_b64 else None
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+async def decrypt_sharepoint_file(
+    document_url: str,
+    filename: str | None = None,
+    mime_type: str | None = None,
+    access_token: str | None = None,
+    nonce_b64: str | None = None,
+    associated_data_b64: str | None = None,
+) -> dict[str, Any]:
+    """
+    Decrypt an AES-GCM encrypted document downloaded from SharePoint, OneDrive, or M365.
+
+    Use this when the user provides a SharePoint or Microsoft 365 document link.
+    Do not use this for files uploaded directly in ChatGPT; use decrypt_file instead.
+
+    Encrypted format: [12-byte nonce][ciphertext + 16-byte auth tag].
+    """
+    settings = _load_settings()
 
     try:
-        result = decrypt_aes_gcm(
-            ciphertext=ciphertext,
-            key=settings.decryption_key,
-            nonce=nonce,
-            associated_data=aad,
-            filename=filename,
-            mime_type=mime_type,
-            temp_dir=settings.temp_dir,
+        ciphertext, detected_name = await fetch_document_bytes(
+            document_url,
+            access_token=access_token,
         )
-    except DecryptionError as exc:
+    except SharePointDownloadError as exc:
         return {"success": False, "error": str(exc)}
 
-    logger.info("Decrypted file saved to %s (%d bytes)", result.temp_path, len(result.plaintext))
-
-    resolved_mime = _guess_mime_type(result.filename, result.mime_type)
-    file_id = result.temp_path.name
-    download_url = f"{_public_base_url()}/files/{file_id}"
-    content_text = _extract_readable_text(result.plaintext, result.filename, resolved_mime)
-
-    return {
-        "success": True,
-        "filename": result.filename,
-        "mime_type": resolved_mime,
-        "size_bytes": len(result.plaintext),
-        "expires_in_seconds": settings.temp_ttl_seconds,
-        "content_b64": encode_base64(result.plaintext),
-        "content_text": content_text,
-        "download_url": download_url,
-        "file_uri": {
-            "download_url": download_url,
-            "file_id": file_id,
-            "mime_type": resolved_mime,
-            "file_name": result.filename,
-        },
-        "message": (
-            "Decryption succeeded. Use content_text for document body. "
-            "If content_text is empty, fetch file_uri.download_url for the decrypted file."
-        ),
-    }
+    resolved_filename = filename or detected_name or "decrypted.bin"
+    return await _decrypt_ciphertext(
+        settings=settings,
+        ciphertext=ciphertext,
+        filename=resolved_filename,
+        mime_type=mime_type,
+        nonce_b64=nonce_b64,
+        associated_data_b64=associated_data_b64,
+    )
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
