@@ -47,9 +47,11 @@ def _transport_security() -> TransportSecuritySettings:
 mcp = FastMCP(
     "DLP",
     instructions=(
-        "Use decrypt_file when the user uploads an encrypted document as encrypted_file. "
-        "Use decrypt_sharepoint_file when the user provides a SharePoint, OneDrive, or M365 document link. "
-        "Read answers from content_text when present."
+        "Always call decrypt_file to decrypt AES-GCM encrypted documents. "
+        "If a document is already available in chat (upload or SharePoint connector), "
+        "call decrypt_file with encrypted_file immediately; do not list resources first. "
+        "If only a SharePoint, OneDrive, or M365 link is available, call decrypt_file with document_url. "
+        "Read document body from content_text when present."
     ),
     stateless_http=True,
     json_response=True,
@@ -66,6 +68,25 @@ class EncryptedFileRef(BaseModel):
     file_id: str
     mime_type: str | None = None
     file_name: str | None = None
+
+
+def _coerce_encrypted_file(value: EncryptedFileRef | dict[str, Any] | str | None) -> EncryptedFileRef | None:
+    if value is None:
+        return None
+    if isinstance(value, EncryptedFileRef):
+        return value
+    if isinstance(value, str):
+        raise DecryptionError(
+            "encrypted_file must be passed as a ChatGPT file attachment, not a local path or bare file id"
+        )
+    if isinstance(value, dict):
+        if value.get("file_id") and not value.get("download_url"):
+            raise DecryptionError(
+                "encrypted_file is missing download_url. Re-run decrypt_file with the chat file "
+                "attached as encrypted_file so ChatGPT can supply a downloadable file reference."
+            )
+        return EncryptedFileRef.model_validate(value)
+    raise DecryptionError(f"Unsupported encrypted_file type: {type(value).__name__}")
 
 
 def _load_settings() -> Settings:
@@ -99,18 +120,30 @@ def _extract_readable_text(data: bytes, filename: str, mime_type: str | None) ->
 
 
 async def _load_encrypted_bytes(
-    encrypted_file: EncryptedFileRef | None,
-    encrypted_data_b64: str | None,
-) -> bytes:
-    if encrypted_file is not None:
-        content, _ = await fetch_document_bytes(encrypted_file.download_url)
-        return content
+    *,
+    encrypted_file: EncryptedFileRef | dict[str, Any] | str | None = None,
+    document_url: str | None = None,
+    encrypted_data_b64: str | None = None,
+    access_token: str | None = None,
+) -> tuple[bytes, str | None]:
+    file_ref = _coerce_encrypted_file(encrypted_file)
+    if file_ref is not None:
+        content, detected_name = await fetch_document_bytes(file_ref.download_url)
+        return content, detected_name or file_ref.file_name
+
+    if document_url:
+        content, detected_name = await fetch_document_bytes(
+            document_url,
+            access_token=access_token,
+        )
+        return content, detected_name
 
     if encrypted_data_b64:
-        return decode_base64_payload(encrypted_data_b64)
+        return decode_base64_payload(encrypted_data_b64), None
 
     raise DecryptionError(
-        "Provide encrypted_file for uploaded documents or encrypted_data_b64 for inline ciphertext"
+        "Provide encrypted_file for chat attachments, document_url for SharePoint/M365 links, "
+        "or encrypted_data_b64 for inline ciphertext"
     )
 
 
@@ -179,49 +212,76 @@ async def _decrypt_ciphertext(
 
 
 @mcp.tool(
-    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
-    meta={"openai/fileParams": ["encrypted_file"]},
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
+    meta={
+        "openai/fileParams": ["encrypted_file"],
+        "openai/toolInvocation/invoking": "문서 복호화 중…",
+        "openai/toolInvocation/invoked": "복호화 완료",
+    },
 )
 async def decrypt_file(
     encrypted_file: EncryptedFileRef | None = None,
+    document_url: str | None = None,
     encrypted_data_b64: str | None = None,
     filename: str = "decrypted.bin",
     mime_type: str | None = None,
+    access_token: str | None = None,
     nonce_b64: str | None = None,
     associated_data_b64: str | None = None,
 ) -> dict[str, Any]:
     """
     Decrypt an AES-GCM encrypted file and return the plaintext for ChatGPT inference.
 
-    Use this when the user uploads an encrypted document (.enc or encrypted .docx).
-    Pass the uploaded file as encrypted_file. Do not pass local file paths.
+    Provide exactly one input source:
+    - encrypted_file: encrypted document from chat upload or SharePoint connector
+    - document_url: SharePoint, OneDrive, or M365 sharing link
+    - encrypted_data_b64: inline base64 ciphertext
+
+    When SharePoint has already fetched the document in this chat, call this tool with
+    encrypted_file instead of listing resources or calling other tools.
 
     Encrypted format: [12-byte nonce][ciphertext + 16-byte auth tag].
-  """
+    """
     settings = _load_settings()
+    file_ref = _coerce_encrypted_file(encrypted_file)
 
-    if encrypted_file is not None:
+    if file_ref is not None:
         if not filename or filename == "decrypted.bin":
-            filename = encrypted_file.file_name or filename
+            filename = file_ref.file_name or filename
         if mime_type is None:
-            mime_type = encrypted_file.mime_type
+            mime_type = file_ref.mime_type
 
     try:
-        ciphertext = await _load_encrypted_bytes(encrypted_file, encrypted_data_b64)
+        ciphertext, detected_name = await _load_encrypted_bytes(
+            encrypted_file=encrypted_file,
+            document_url=document_url,
+            encrypted_data_b64=encrypted_data_b64,
+            access_token=access_token,
+        )
     except (DecryptionError, SharePointDownloadError, httpx.HTTPError) as exc:
         return {"success": False, "error": str(exc)}
+
+    resolved_filename = filename
+    if resolved_filename == "decrypted.bin" and detected_name:
+        resolved_filename = detected_name
 
     return await _decrypt_ciphertext(
         settings=settings,
         ciphertext=ciphertext,
-        filename=filename,
+        filename=resolved_filename,
         mime_type=mime_type,
         nonce_b64=nonce_b64,
         associated_data_b64=associated_data_b64,
     )
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
+    meta={
+        "openai/toolInvocation/invoking": "SharePoint 문서 복호화 중…",
+        "openai/toolInvocation/invoked": "복호화 완료",
+    },
+)
 async def decrypt_sharepoint_file(
     document_url: str,
     filename: str | None = None,
@@ -231,29 +291,18 @@ async def decrypt_sharepoint_file(
     associated_data_b64: str | None = None,
 ) -> dict[str, Any]:
     """
-    Decrypt an AES-GCM encrypted document downloaded from SharePoint, OneDrive, or M365.
+    Decrypt an AES-GCM encrypted document from a SharePoint, OneDrive, or M365 link.
 
-    Use this when the user provides a SharePoint or Microsoft 365 document link.
-    Do not use this for files uploaded directly in ChatGPT; use decrypt_file instead.
+    Prefer decrypt_file with encrypted_file when the document is already available in chat.
+    Use this only when you have a document_url and no chat file attachment yet.
 
     Encrypted format: [12-byte nonce][ciphertext + 16-byte auth tag].
     """
-    settings = _load_settings()
-
-    try:
-        ciphertext, detected_name = await fetch_document_bytes(
-            document_url,
-            access_token=access_token,
-        )
-    except SharePointDownloadError as exc:
-        return {"success": False, "error": str(exc)}
-
-    resolved_filename = filename or detected_name or "decrypted.bin"
-    return await _decrypt_ciphertext(
-        settings=settings,
-        ciphertext=ciphertext,
-        filename=resolved_filename,
+    return await decrypt_file(
+        document_url=document_url,
+        filename=filename or "decrypted.bin",
         mime_type=mime_type,
+        access_token=access_token,
         nonce_b64=nonce_b64,
         associated_data_b64=associated_data_b64,
     )
