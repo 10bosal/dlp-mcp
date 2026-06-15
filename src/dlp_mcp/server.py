@@ -45,13 +45,16 @@ def _transport_security() -> TransportSecuritySettings:
 
 
 mcp = FastMCP(
-    "DLP",
+    "DLP Decrypt",
     instructions=(
-        "Always call decrypt_file to decrypt AES-GCM encrypted documents. "
-        "If a document is already available in chat (upload or SharePoint connector), "
-        "call decrypt_file with encrypted_file immediately; do not list resources first. "
-        "If only a SharePoint, OneDrive, or M365 link is available, call decrypt_file with document_url. "
-        "Read document body from content_text when present."
+        "This server decrypts DLP AES-256-GCM encrypted files. The decryption key is configured "
+        "on the server; never ask the user for a password, Office password, or encryption method. "
+        "Files named *_enc* (for example 2026_Wordcup_result_enc.docx) or *.enc are whole-file "
+        "AES-GCM ciphertext, NOT Microsoft Office password-protected documents. "
+        "When SharePoint or a chat attachment shows null/unreadable content for such files, "
+        "call decrypt_file immediately with encrypted_file (file already in chat) or document_url "
+        "(only a SharePoint/M365 link). Do not read encrypted files directly. "
+        "Use content_text from the tool result for document body."
     ),
     stateless_http=True,
     json_response=True,
@@ -211,11 +214,22 @@ async def _decrypt_ciphertext(
     return _format_decrypt_result(result, settings)
 
 
+_DECRYPT_FILE_DESCRIPTION = (
+    "Decrypt DLP AES-256-GCM encrypted documents (for example *_enc.docx, *.enc). "
+    "The server holds the key; never ask the user for a password. "
+    "This is NOT Microsoft Office password protection. "
+    "When SharePoint shows null content for an *_enc* file, call this tool with encrypted_file "
+    "or document_url instead of reading the file directly."
+)
+
+
 @mcp.tool(
+    title="Decrypt DLP encrypted file",
+    description=_DECRYPT_FILE_DESCRIPTION,
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
     meta={
         "openai/fileParams": ["encrypted_file"],
-        "openai/toolInvocation/invoking": "문서 복호화 중…",
+        "openai/toolInvocation/invoking": "DLP 문서 복호화 중…",
         "openai/toolInvocation/invoked": "복호화 완료",
     },
 )
@@ -230,17 +244,14 @@ async def decrypt_file(
     associated_data_b64: str | None = None,
 ) -> dict[str, Any]:
     """
-    Decrypt an AES-GCM encrypted file and return the plaintext for ChatGPT inference.
+    Decrypt a DLP AES-GCM encrypted file and return plaintext for inference.
 
-    Provide exactly one input source:
-    - encrypted_file: encrypted document from chat upload or SharePoint connector
-    - document_url: SharePoint, OneDrive, or M365 sharing link
+    Input (provide exactly one):
+    - encrypted_file: chat upload or SharePoint-fetched encrypted file
+    - document_url: SharePoint, OneDrive, or M365 link to encrypted file
     - encrypted_data_b64: inline base64 ciphertext
 
-    When SharePoint has already fetched the document in this chat, call this tool with
-    encrypted_file instead of listing resources or calling other tools.
-
-    Encrypted format: [12-byte nonce][ciphertext + 16-byte auth tag].
+    Format: [12-byte nonce][ciphertext + 16-byte auth tag]. No user password required.
     """
     settings = _load_settings()
     file_ref = _coerce_encrypted_file(encrypted_file)
@@ -276,8 +287,11 @@ async def decrypt_file(
 
 
 @mcp.tool(
+    title="Decrypt DLP file from SharePoint URL",
+    description="Legacy alias for decrypt_file(document_url=...). Prefer decrypt_file.",
     annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False),
     meta={
+        "ui": {"visibility": ["app"]},
         "openai/toolInvocation/invoking": "SharePoint 문서 복호화 중…",
         "openai/toolInvocation/invoked": "복호화 완료",
     },
