@@ -9,6 +9,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from pypdf import PdfReader
 
 
 @dataclass(frozen=True)
@@ -116,4 +117,24 @@ def extract_docx_text(data: bytes) -> str | None:
             paragraphs.append("".join(parts))
 
     text = "\n".join(paragraphs).strip()
+    return text or None
+
+
+def extract_pdf_text(data: bytes) -> str | None:
+    """Extract plain text from a PDF file."""
+    try:
+        reader = PdfReader(BytesIO(data))
+    except Exception:
+        return None
+
+    pages: list[str] = []
+    for page in reader.pages:
+        try:
+            page_text = page.extract_text() or ""
+        except Exception:
+            page_text = ""
+        if page_text.strip():
+            pages.append(page_text.strip())
+
+    text = "\n\n".join(pages).strip()
     return text or None

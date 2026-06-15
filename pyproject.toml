@@ -7,6 +7,7 @@ requires-python = ">=3.11"
 dependencies = [
     "mcp>=1.27,<2",
     "cryptography>=44.0",
+    "pypdf>=5.0",
     "python-dotenv>=1.0",
     "uvicorn>=0.34",
     "starlette>=0.46",

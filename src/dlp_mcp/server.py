@@ -26,6 +26,7 @@ from dlp_mcp.decrypt import (
     decrypt_aes_gcm,
     encode_base64,
     extract_docx_text,
+    extract_pdf_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,8 @@ def _extract_readable_text(data: bytes, filename: str, mime_type: str | None) ->
         return text
     if filename.lower().endswith(".docx") or (mime_type or "").endswith("wordprocessingml.document"):
         return extract_docx_text(data)
+    if filename.lower().endswith(".pdf") or (mime_type or "") == "application/pdf":
+        return extract_pdf_text(data)
     return None
 
 
